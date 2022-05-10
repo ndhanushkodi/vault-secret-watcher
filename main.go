@@ -1,86 +1,74 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	dep "github.com/hashicorp/consul-template/dependency"
-	"github.com/hashicorp/consul-template/watch"
+	"github.com/hashicorp/hcat"
+	"github.com/hashicorp/hcat/tfunc"
 )
 
 func main() {
 	// make the consul-template library logs not show up
 	log.SetOutput(ioutil.Discard)
 
-	// setup Vault API client
-	clients := dep.NewClientSet()
-	clients.CreateVaultClient(&dep.CreateVaultClientInput{
-		Address:     "http://127.0.0.1:8200",
-		Namespace:   "",
-		Token:       "hvs.Ic25dAXwQNgEFzINCVlzgySC",
-		UnwrapToken: false,
-		SSLEnabled:  false,
-		SSLVerify:   false,
-		SSLCert:     "",
-		SSLKey:      "",
-		SSLCACert:   "",
-		SSLCAPath:   "",
-		ServerName:  "",
+	clients := hcat.NewClientSet()
+	defer clients.Stop()
+
+	clients.AddVault(hcat.VaultInput{
+		Address: "http://127.0.0.1:8200",
+		Token:   "a_token",
 	})
 
 	// create new watcher with the Vault API client
-	w, err := watch.NewWatcher(&watch.NewWatcherInput{
+	w := hcat.NewWatcher(hcat.WatcherInput{
 		Clients: clients,
+		Cache:   hcat.NewStore(),
 	})
+	tmpl := hcat.NewTemplate(hcat.TemplateInput{
+		Name:         "secret/hello",
+		Contents:     `{{- with secret "secret/hello" -}}{{- .Data.data.foo -}}{{- end -}}`,
+		FuncMapMerge: tfunc.VaultV0(),
+	})
+	err := w.Register(tmpl)
 	if err != nil {
-		fmt.Printf("err: %w\n", err)
+		panic(err)
 	}
 
-	// setup a dependency to watch the Vault secret "secret/hello"
-	vrq, err := dep.NewVaultReadQuery("secret/hello")
-	if err != nil {
-		fmt.Println("tried to vault read query")
-		fmt.Printf("err: %w\n", err)
-	}
-	// fetch the initial secret, and store it in the secretmap, so we can compare it during the polling
-	i, _, err := vrq.Fetch(clients, &dep.QueryOptions{})
+	rsv := hcat.NewResolver()
 	secretmap := map[string]string{}
-	secret := i.(*dep.Secret)
-	secretmap["secret/hello"] = secret.Data["data"].(map[string]interface{})["foo"].(string)
-
-	// add the dependency to the watcher
-	w.Add(vrq)
-
-	datach := w.DataCh()
-	errch := w.ErrCh()
-
-	// this goroutine watches the poller, and compares it to what's in the secretmap to indicate if there's a change
 	go func() {
 		for {
-			select {
-			// check if there's a change to the secret and print
-			case got := <-datach:
-				vaultsecret := got.Data().(*dep.Secret)
-				if secretmap["secret/hello"] != vaultsecret.Data["data"].(map[string]interface{})["foo"].(string) {
-					fmt.Printf("Secret %s has been changed", "secret/hello")
+			res, err := rsv.Run(tmpl, w)
+			if err != nil {
+				panic(err)
+			}
+			if res.Complete {
+				vaultsecret := string(res.Contents)
+				if secretmap["secret/hello"] != vaultsecret {
+					fmt.Printf("Secret '%s' has been changed to '%s'.\n",
+						"secret/hello", vaultsecret)
 				}
-				//fmt.Println(got.DataAndLastIndex())
-				secretmap["secret/hello"] = vaultsecret.Data["data"].(map[string]interface{})["foo"].(string)
-			case got := <-errch:
-				fmt.Println("got an error for the dependency")
-				fmt.Printf("err %w\n", got)
+				secretmap["secret/hello"] = vaultsecret
+			}
+			ctx, cancel := context.WithTimeout(
+				context.Background(), time.Second*3)
+			err = w.Wait(ctx)
+			cancel()
+			if err != nil {
+				panic(err)
 			}
 		}
 	}()
 
 	// make the main run until interrupt
-	c := make(chan os.Signal)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
 	<-c
-
 }
